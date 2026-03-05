@@ -152,6 +152,7 @@ function App() {
   const [prebufferClips, setPrebufferClips] = useState([]);
   const [clipDateFilter, setClipDateFilter] = useState('');
   const [videoModal, setVideoModal] = useState(null); // { url, title, type }
+  const [spikeTrainHistory, setSpikeTrainHistory] = useState([]);
   const [availableCameras, setAvailableCameras] = useState([]);
   const [activeCamIds, setActiveCamIds] = useState([]);
   const [cameraLoading, setCameraLoading] = useState({});
@@ -376,6 +377,17 @@ function App() {
           }
           return updated;
         });
+
+        // Update spike train history (last 60 data points)
+        setSpikeTrainHistory(prev => {
+          const entry = { time: Date.now() };
+          for (const [camId, cd] of Object.entries(lastJsonMessage.cameras)) {
+            entry[camId] = cd.snn_spike ? 1 : 0;
+            entry[`diff_${camId}`] = cd.snn_diff || 0;
+            entry[`membrane_${camId}`] = cd.snn_membrane || 0;
+          }
+          return [...prev, entry].slice(-60);
+        });
       }
     }
   }, [lastJsonMessage]);
@@ -398,6 +410,23 @@ function App() {
     if (cat === 'NORMAL') return 'severity-high';
     return 'severity-low';
   };
+
+  // Aggregate bandwidth stats across all cameras
+  const bandwidthStats = useMemo(() => {
+    let totalFrames = 0, spikeFrames = 0, skippedFrames = 0;
+    const perCam = [];
+    for (const camId of activeCamIds) {
+      const cd = camerasData[camId];
+      if (cd) {
+        totalFrames += cd.frame_count || 0;
+        spikeFrames += cd.spike_count || 0;
+        skippedFrames += cd.frames_skipped || 0;
+        perCam.push({ camId, savings: cd.compute_savings || 0 });
+      }
+    }
+    const savings = totalFrames > 0 ? ((skippedFrames / totalFrames) * 100).toFixed(1) : 0;
+    return { totalFrames, spikeFrames, skippedFrames, savings, perCam };
+  }, [camerasData, activeCamIds]);
 
   // Aggregate stats from first camera for backward compat
   const firstCamId = activeCamIds[0] || '';
@@ -646,6 +675,140 @@ function App() {
             <div className="zone zone-idle">IDLE 0–30</div>
             <div className="zone zone-normal">NORMAL 30–60</div>
             <div className="zone zone-event">EVENT 60–100</div>
+          </div>
+        </div>
+
+        {/* ---- Bandwidth Savings Live Counter ---- */}
+        <div className="panel bandwidth-panel">
+          <div className="panel-header">📡 SNN BANDWIDTH SAVINGS — LIVE</div>
+          <div className="bandwidth-content">
+            <div className="bandwidth-hero">
+              <div className="bandwidth-ring">
+                <svg viewBox="0 0 120 120" className="bandwidth-svg">
+                  <circle cx="60" cy="60" r="52" fill="none" stroke="#0d2d50" strokeWidth="8" />
+                  <circle
+                    cx="60" cy="60" r="52" fill="none"
+                    stroke={bandwidthStats.savings > 50 ? '#00ff88' : bandwidthStats.savings > 20 ? '#ffaa00' : '#ff4d4d'}
+                    strokeWidth="8"
+                    strokeLinecap="round"
+                    strokeDasharray={`${(bandwidthStats.savings / 100) * 327} 327`}
+                    transform="rotate(-90 60 60)"
+                    style={{ transition: 'stroke-dasharray 0.8s ease' }}
+                  />
+                </svg>
+                <div className="bandwidth-ring-text">
+                  <span className="bandwidth-pct">{bandwidthStats.savings}%</span>
+                  <span className="bandwidth-label">SAVED</span>
+                </div>
+              </div>
+              <div className="bandwidth-stats">
+                <div className="bw-stat">
+                  <span className="bw-stat-val green">{bandwidthStats.skippedFrames.toLocaleString()}</span>
+                  <span className="bw-stat-lbl">FRAMES SKIPPED</span>
+                </div>
+                <div className="bw-stat">
+                  <span className="bw-stat-val cyan">{bandwidthStats.spikeFrames.toLocaleString()}</span>
+                  <span className="bw-stat-lbl">FRAMES PROCESSED</span>
+                </div>
+                <div className="bw-stat">
+                  <span className="bw-stat-val orange">{bandwidthStats.totalFrames.toLocaleString()}</span>
+                  <span className="bw-stat-lbl">TOTAL FRAMES</span>
+                </div>
+              </div>
+            </div>
+            {bandwidthStats.perCam.length > 1 && (
+              <div className="bandwidth-per-cam">
+                {bandwidthStats.perCam.map(({ camId, savings }) => (
+                  <div key={camId} className="bw-cam-row">
+                    <span className="bw-cam-name">{camId.replace(/_/g, ' ').toUpperCase()}</span>
+                    <div className="bw-cam-bar-bg">
+                      <div className="bw-cam-bar-fill" style={{ width: `${savings}%`, transition: 'width 0.5s ease' }} />
+                    </div>
+                    <span className="bw-cam-pct">{savings.toFixed(1)}%</span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* ---- SNN Spike Train Visualizer ---- */}
+        <div className="panel spike-viz-panel">
+          <div className="panel-header">🧠 SNN SPIKE TRAIN — NEURAL ACTIVITY</div>
+          <div className="spike-viz-content">
+            {activeCamIds.map((camId, camIdx) => {
+              const color = CAMERA_COLORS[camIdx % CAMERA_COLORS.length];
+              return (
+                <div key={camId} className="spike-train-row">
+                  {activeCamIds.length > 1 && (
+                    <div className="spike-train-label" style={{ color }}>{camId.replace(/_/g, ' ').toUpperCase()}</div>
+                  )}
+                  <div className="spike-train-track">
+                    {spikeTrainHistory.map((entry, i) => {
+                      const spiked = entry[camId] === 1;
+                      const membrane = entry[`membrane_${camId}`] || 0;
+                      return (
+                        <div
+                          key={i}
+                          className={`spike-dot ${spiked ? 'fired' : ''}`}
+                          style={{
+                            '--dot-color': color,
+                            height: spiked ? '100%' : `${Math.max(8, membrane * 70)}%`,
+                            animationDelay: `${i * 15}ms`
+                          }}
+                        />
+                      );
+                    })}
+                  </div>
+                  <div className="spike-train-stats">
+                    <span className="spike-indicator" style={{ background: camerasData[camId]?.snn_spike ? color : '#1a3652' }}>
+                      {camerasData[camId]?.snn_spike ? '⚡' : '—'}
+                    </span>
+                    <span className="spike-membrane-val">M: {(camerasData[camId]?.snn_membrane || 0).toFixed(2)}</span>
+                    <span className="spike-threshold-val">T: {(camerasData[camId]?.snn_threshold || 0).toFixed(2)}</span>
+                  </div>
+                </div>
+              );
+            })}
+            {activeCamIds.length === 0 && (
+              <div className="spike-empty">Start a camera to see neural spike activity</div>
+            )}
+            <div className="spike-legend">
+              <span className="spike-legend-item"><span className="spike-legend-dot fired-demo"></span> Spike (YOLO runs)</span>
+              <span className="spike-legend-item"><span className="spike-legend-dot idle-demo"></span> Membrane level (no YOLO)</span>
+            </div>
+          </div>
+        </div>
+
+        {/* ---- Architecture Diagram ---- */}
+        <div className="panel arch-panel">
+          <div className="panel-header">🏗️ PIPELINE ARCHITECTURE — LIVE STATUS</div>
+          <div className="arch-diagram">
+            {[
+              { key: 'cam', icon: '📷', label: 'Camera Input', desc: 'OpenCV capture', active: activeCamIds.length > 0, stat: `${activeCamIds.length} active` },
+              { key: 'snn', icon: '🧠', label: 'SNN Spike Gate', desc: 'LIF neuron filter', active: snnSpike, stat: `${data?.spike_rate || 0}% rate` },
+              { key: 'yolo', icon: '🎯', label: 'YOLOv8-nano', desc: 'Person detection', active: snnSpike && detections.length > 0, stat: `${detections.length} det` },
+              { key: 'scorer', icon: '📊', label: 'Frame Scorer', desc: 'Threat assessment', active: (firstCamData?.score || 0) > 0, stat: `Score: ${firstCamData?.score || 0}` },
+              { key: 'anomaly', icon: '🔍', label: 'Anomaly Det.', desc: 'Loiter + scene', active: (data?.active_tracks || 0) > 0, stat: `${data?.active_tracks || 0} tracks` },
+              { key: 'compress', icon: '🗜️', label: 'Compressor', desc: 'zstd + 7z', active: activeCamIds.length > 0, stat: `${bandwidthStats.savings}% saved` },
+              { key: 'db', icon: '🗄️', label: 'Forensic DB', desc: 'SQLite logging', active: events.length > 0 || alerts.length > 0, stat: `${events.length} events` },
+              { key: 'dash', icon: '📡', label: 'Dashboard', desc: 'WebSocket live', active: wsConnected, stat: wsConnected ? 'LIVE' : 'OFF' }
+            ].map((stage, i, arr) => (
+              <React.Fragment key={stage.key}>
+                <div className={`arch-node ${stage.active ? 'arch-active' : 'arch-idle'}`}>
+                  <div className={`arch-status-dot ${stage.active ? 'dot-green' : 'dot-red'}`} />
+                  <div className="arch-icon">{stage.icon}</div>
+                  <div className="arch-label">{stage.label}</div>
+                  <div className="arch-desc">{stage.desc}</div>
+                  <div className="arch-stat">{stage.stat}</div>
+                </div>
+                {i < arr.length - 1 && (
+                  <div className={`arch-arrow ${stage.active ? 'arch-arrow-active' : ''}`}>
+                    <span>▶</span>
+                  </div>
+                )}
+              </React.Fragment>
+            ))}
           </div>
         </div>
 
