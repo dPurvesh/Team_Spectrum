@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+backend/venv/
+
+# Storage (generated at runtime)
+backend/storage/
+*.db
+*.7z
+*.zst
+
+# YOLO model weights (large, downloaded automatically)
+backend/yolov8n.pt
+
+# Node
+frontend/edgevid-dashboard/node_modules/
+frontend/edgevid-dashboard/build/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.swp
