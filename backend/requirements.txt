@@ -1,0 +1,24 @@
+# EdgeVid LowBand - Backend Dependencies
+# Python 3.12+
+
+# Core AI
+ultralytics>=8.0.0          # YOLOv8
+torch>=2.0.0                # PyTorch (CPU)
+spikingjelly>=0.0.0.0.14    # Neuromorphic SNN
+numpy>=1.24.0               # Array operations
+
+# Computer Vision
+opencv-python>=4.8.0        # Camera & image processing
+
+# Web Server
+fastapi>=0.104.0            # REST API + WebSocket
+uvicorn[standard]>=0.24.0   # ASGI server
+websockets>=12.0            # WebSocket support
+python-multipart>=0.0.6     # File uploads
+
+# Compression
+zstandard>=0.22.0           # zstd compression
+py7zr>=0.20.0               # 7z archives
+
+# Utilities
+aiofiles>=23.0.0            # Async file ops

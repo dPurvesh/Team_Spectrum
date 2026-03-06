@@ -2,13 +2,62 @@
 SNN Spike Gate — Neuromorphic Pre-Filter
 Works like a human brain — ignores boring frames, fires only when something changes.
 Saves 80% compute by skipping idle frames before YOLO ever runs.
+
+v2: Added fallback mode for when torch/spikingjelly unavailable.
+v3: Default to fallback (numpy LIF) to avoid torch import issues.
+    Set USE_SPIKINGJELLY=1 env var to enable torch version.
 """
 
+import os
 import cv2
-import torch
 import numpy as np
 from collections import deque
-from spikingjelly.activation_based import neuron, surrogate
+
+# Default to fallback to avoid torch import hang issues
+# Set USE_SPIKINGJELLY=1 environment variable to enable torch version
+_USE_SPIKINGJELLY = False
+_FORCE_SPIKINGJELLY = os.environ.get("USE_SPIKINGJELLY", "0") == "1"
+
+if _FORCE_SPIKINGJELLY:
+    try:
+        import torch
+        from spikingjelly.activation_based import neuron, surrogate
+        _USE_SPIKINGJELLY = True
+        print("✓ SNN Gate: Using SpikingJelly LIF neuron")
+    except ImportError as e:
+        print(f"⚠ SNN Gate: SpikingJelly not available ({e}), using fallback LIF")
+    except Exception as e:
+        print(f"⚠ SNN Gate: torch/spikingjelly load error ({e}), using fallback LIF")
+else:
+    print("✓ SNN Gate: Using optimized numpy LIF neuron (fast startup)")
+
+
+class FallbackLIFNeuron:
+    """Pure numpy implementation of Leaky Integrate-and-Fire neuron."""
+    
+    def __init__(self, tau=2.0, v_threshold=1.0, v_reset=0.0):
+        self.tau = tau
+        self.decay = 1.0 - (1.0 / tau)  # Membrane decay factor
+        self.v_threshold = v_threshold
+        self.v_reset = v_reset
+        self.membrane = 0.0
+    
+    def __call__(self, x):
+        """Process input and return spike (0 or 1)."""
+        # Input can be a single value or array
+        val = float(x[0]) if hasattr(x, '__len__') else float(x)
+        
+        # Leaky integrate
+        self.membrane = self.membrane * self.decay + val
+        
+        # Fire check
+        if self.membrane >= self.v_threshold:
+            self.membrane = self.v_reset
+            return np.array([1.0])
+        return np.array([0.0])
+    
+    def reset(self):
+        self.membrane = 0.0
 
 
 class SNNSpikeGate:
@@ -22,13 +71,20 @@ class SNNSpikeGate:
         self.spike_count = 0
         self.diff_history = deque(maxlen=1000)
 
-        # SpikingJelly LIF neuron
-        self.lif_neuron = neuron.LIFNode(
-            tau=2.0,
-            surrogate_function=surrogate.ATan(),
-            v_threshold=1.0,
-            v_reset=0.0
-        )
+        # Use SpikingJelly if available, otherwise fallback
+        if _USE_SPIKINGJELLY:
+            self.lif_neuron = neuron.LIFNode(
+                tau=2.0,
+                surrogate_function=surrogate.ATan(),
+                v_threshold=1.0,
+                v_reset=0.0
+            )
+        else:
+            self.lif_neuron = FallbackLIFNeuron(
+                tau=2.0,
+                v_threshold=1.0,
+                v_reset=0.0
+            )
 
     def process_frame(self, frame):
         """
@@ -53,10 +109,14 @@ class SNNSpikeGate:
         self.diff_history.append(diff_score)
         self.prev_frame = gray
 
-        # Feed diff_score through SpikingJelly LIF neuron
-        inp = torch.tensor([diff_score], dtype=torch.float32)
-        spike_out = self.lif_neuron(inp)
-        lif_fired = spike_out.item() > 0.5
+        # Feed diff_score through LIF neuron (SpikingJelly or fallback)
+        if _USE_SPIKINGJELLY:
+            inp = torch.tensor([diff_score], dtype=torch.float32)
+            spike_out = self.lif_neuron(inp)
+            lif_fired = spike_out.item() > 0.5
+        else:
+            spike_out = self.lif_neuron(np.array([diff_score]))
+            lif_fired = spike_out[0] > 0.5
 
         # Also track manual membrane as a secondary signal
         self.membrane_potential = (self.membrane_potential * self.decay) + diff_score

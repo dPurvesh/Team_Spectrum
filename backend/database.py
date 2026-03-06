@@ -17,6 +17,17 @@ class ForensicDatabase:
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self._create_tables()
+        self._migrate_tables()
+
+    def _migrate_tables(self):
+        """Add missing columns to existing tables (safe migrations)."""
+        cursor = self.conn.cursor()
+        # Check if session_name column exists in events table
+        cursor.execute("PRAGMA table_info(events)")
+        columns = [row[1] for row in cursor.fetchall()]
+        if 'session_name' not in columns:
+            cursor.execute("ALTER TABLE events ADD COLUMN session_name TEXT")
+            self.conn.commit()
 
     def _create_tables(self):
         cursor = self.conn.cursor()
@@ -25,6 +36,7 @@ class ForensicDatabase:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 timestamp TEXT NOT NULL,
                 camera_id TEXT DEFAULT 'CAM_01',
+                session_name TEXT,
                 frame_number INTEGER,
                 score REAL,
                 category TEXT,
@@ -74,7 +86,7 @@ class ForensicDatabase:
     def log_event(self, frame_number, score, category, detections,
                   event_type="ACTIVITY", severity="LOW", camera_id="CAM_01",
                   anomaly_flag=False, duration=0.0, frame_path=None,
-                  prebuffer_path=None, compression_type=None):
+                  prebuffer_path=None, compression_type=None, session_name=None):
 
         person_count = sum(1 for d in detections if d.get('is_person'))
         max_conf = max((d.get('confidence', 0) for d in detections), default=0.0)
@@ -87,13 +99,13 @@ class ForensicDatabase:
         cursor = self.conn.cursor()
         cursor.execute('''
             INSERT INTO events
-            (timestamp, camera_id, frame_number, score, category,
+            (timestamp, camera_id, session_name, frame_number, score, category,
              event_type, severity, person_count, max_confidence,
              object_classes, anomaly_flag, duration_seconds,
              frame_path, prebuffer_path, compression_type, description)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
-            datetime.now().isoformat(), camera_id, frame_number,
+            datetime.now().isoformat(), camera_id, session_name, frame_number,
             score, category, event_type, severity, person_count,
             round(max_conf, 3), json.dumps(classes), int(anomaly_flag),
             duration, frame_path, prebuffer_path, compression_type,
