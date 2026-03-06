@@ -32,7 +32,7 @@
 ## System Architecture
 
 ```mermaid
-%%{init: {'theme': 'base', 'themeVariables': {'background': '#ffffff', 'mainBkg': '#ffffff', 'clusterBkg': '#f8fafc', 'clusterBorder': '#cbd5e1', 'titleColor': '#0f172a', 'edgeLabelBackground': '#ffffff', 'lineColor': '#64748b'}}}%%
+%%{init: {'theme': 'base', 'themeVariables': {'background': '#ffffff', 'mainBkg': '#ffffff', 'edgeLabelBackground': '#ffffff', 'lineColor': '#64748b'}}}%%
 flowchart LR
     classDef cam      fill:#dbeafe,stroke:#2563eb,stroke-width:2px,color:#1e3a8a
     classDef snn      fill:#ede9fe,stroke:#7c3aed,stroke-width:2px,color:#3b0764
@@ -44,53 +44,34 @@ flowchart LR
     classDef infra    fill:#e0f2fe,stroke:#0284c7,stroke-width:2px,color:#0c4a6e
 
     CAM["Camera Input\nWebcam / RTSP / IP"]:::cam
-
-    subgraph NEURAL ["  Neural Processing  "]
-        direction TB
-        SNN["SNN Spike Gate\nSkips 80% idle frames"]:::snn
-        SKIP["Skip Frame\nZero Compute"]:::skip
-        YOLO["YOLOv8-nano\nObject Detection"]:::yolo
-        ANOM["Anomaly Detector\nLoitering Detection"]:::alert
-    end
-
-    subgraph SCORE_LAYER ["  Intelligence Scoring  "]
-        direction TB
-        SCORE["Frame Score\n0 to 100"]:::score
-        DEC{{"Threshold"}}:::score
-        HEAVY["Heavy Compress\nScore below 30\n15% JPEG"]:::skip
-        ROI["ROI Compress\nScore above 60\nSubject 88% / BG 12%"]:::compress
-    end
-
-    subgraph STORE ["  Data Layer  "]
-        direction TB
-        PREBUF["Pre-Event Buffer\n30s Circular"]:::snn
-        DB[("SQLite\nForensic Log")]:::infra
-        API["FastAPI Server\nWebSocket"]:::infra
-    end
-
-    DASH["React Dashboard\nLive Feed / Clips\nAlerts / Stats"]:::compress
+    SNN["SNN Spike Gate\nSkips 80% idle frames"]:::snn
+    SKIP["Skip Frame\nZero Compute"]:::skip
+    YOLO["YOLOv8-nano\nObject Detection"]:::yolo
+    ANOM["Anomaly Detector\nLoitering Detection"]:::alert
+    PREBUF["Pre-Event Buffer\n30s Circular"]:::snn
+    SCORE["Frame Score\n0 to 100"]:::score
+    DEC{{"Threshold"}}:::score
+    HEAVY["Heavy Compress\nScore below 30 — 15% JPEG"]:::skip
+    ROI["ROI Compress\nSubject 88% / BG 12%"]:::compress
+    DB[("SQLite\nForensic Log")]:::infra
+    API["FastAPI Server\nWebSocket"]:::infra
+    DASH["React Dashboard\nLive Feed / Clips / Alerts"]:::compress
 
     CAM --> SNN
     CAM --> PREBUF
-
     SNN -->|"No Spike"| SKIP
     SNN -->|"Spike"| YOLO
     SNN -->|"Anomaly"| ANOM
-
     YOLO --> ANOM
     YOLO --> SCORE
-
     SCORE --> DEC
     DEC -->|"below 30"| HEAVY
     DEC -->|"above 60"| ROI
-
     PREBUF --> DB
     ANOM --> DB
     ANOM --> API
-
     ROI --> API
     HEAVY --> API
-
     DB -->|"Query"| API
     API --> DASH
 ```
