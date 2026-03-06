@@ -7,7 +7,11 @@
 ## Team Details
 
 - **Team Name:** Team Spectrum
-- **Members:** Veer Gandhi (Team Leader), Sanchit Borikar, Purvesh Didpaye, Ashraf Ahmed
+- **Members:**
+  - Veer Gandhi (Team Leader)
+  - Sanchit Borikar
+  - Purvesh Didpaye
+  - Ashraf Ahmed
 - **Domain:** Productivity & Security (PS-04)
 
 ---
@@ -19,7 +23,7 @@
 **Solution:** EdgeVid LowBand is a neuromorphic edge-AI DVR that fundamentally changes how video is processed.
 
 - **SNN Spike Gate:** Acts as a neuromorphic pre-filter, bypassing 80% of compute load by skipping idle frames entirely before object detection runs.
-- **Hardware-Accelerated YOLOv8:** Runs precision object detection strictly on SNN spikes, grading every frame with an Intelligence Score (0-100).
+- **Hardware-Accelerated YOLOv8:** Runs precision object detection strictly on SNN spikes, grading every frame with an Intelligence Score (0–100).
 - **Dynamic ROI Compression:** Applies extreme spatial compression to backgrounds (15% quality) while keeping the target subject crystal clear (88% quality), achieving a 70% overall reduction in storage overhead.
 - **Forensic Auditing:** Features a predictive 30-second pre-buffer for anomaly events (like loitering) and logs all metrics to an immutable SQLite database without relying on external cloud APIs.
 
@@ -28,66 +32,67 @@
 ## System Architecture
 
 ```mermaid
-%%{init: {"flowchart": {"curve": "step", "nodeSpacing": 50, "rankSpacing": 70}}}%%
+%%{init: {'theme': 'base', 'themeVariables': {'background': '#ffffff', 'mainBkg': '#ffffff', 'clusterBkg': '#f8fafc', 'clusterBorder': '#cbd5e1', 'titleColor': '#0f172a', 'edgeLabelBackground': '#ffffff', 'lineColor': '#64748b'}}}%%
 flowchart LR
-    classDef cam      fill:#1e293b,stroke:#60a5fa,stroke-width:2px,color:#f1f5f9
-    classDef snn      fill:#2e1065,stroke:#a855f7,stroke-width:2px,color:#f1f5f9
-    classDef yolo     fill:#172554,stroke:#3b82f6,stroke-width:2px,color:#f1f5f9
-    classDef score    fill:#7c2d12,stroke:#f97316,stroke-width:2px,color:#f1f5f9
-    classDef skip     fill:#1e293b,stroke:#64748b,stroke-width:2px,color:#94a3b8
-    classDef alert    fill:#450a0a,stroke:#ef4444,stroke-width:2px,color:#f1f5f9
-    classDef compress fill:#064e3b,stroke:#10b981,stroke-width:2px,color:#f1f5f9
-    classDef infra    fill:#0f172a,stroke:#38bdf8,stroke-width:2px,color:#f1f5f9
+    classDef cam      fill:#dbeafe,stroke:#2563eb,stroke-width:2px,color:#1e3a8a
+    classDef snn      fill:#ede9fe,stroke:#7c3aed,stroke-width:2px,color:#3b0764
+    classDef yolo     fill:#dbeafe,stroke:#1d4ed8,stroke-width:2px,color:#1e3a8a
+    classDef score    fill:#ffedd5,stroke:#ea580c,stroke-width:2px,color:#7c2d12
+    classDef skip     fill:#f1f5f9,stroke:#94a3b8,stroke-width:2px,color:#475569
+    classDef alert    fill:#fee2e2,stroke:#dc2626,stroke-width:2px,color:#7f1d1d
+    classDef compress fill:#dcfce7,stroke:#16a34a,stroke-width:2px,color:#14532d
+    classDef infra    fill:#e0f2fe,stroke:#0284c7,stroke-width:2px,color:#0c4a6e
 
-    subgraph INPUT ["Input"]
-        direction TB
-        C1["Camera 1\nWebcam / USB"]:::cam
-        C2["Camera 2\nIP / RTSP"]:::cam
-    end
+    CAM["Camera Input\nWebcam / RTSP / IP"]:::cam
 
-    subgraph PIPELINE ["Edge Processing Pipeline"]
+    subgraph NEURAL ["  Neural Processing  "]
         direction TB
-        SNN["SNN Spike Gate\nSkips 80% of idle frames"]:::snn
+        SNN["SNN Spike Gate\nSkips 80% idle frames"]:::snn
         SKIP["Skip Frame\nZero Compute"]:::skip
         YOLO["YOLOv8-nano\nObject Detection"]:::yolo
-        SCORE["Frame Intelligence Score\n0 to 100"]:::score
-        DEC{{"Score?"}}:::score
-        HEAVY["Heavy Compress\nBelow 30 — 15% JPEG"]:::skip
-        ROI["ROI Compression\nAbove 60 — Subject 88% · BG 12%"]:::compress
-    end
-
-    subgraph INFRA ["Data Layer and Dashboard"]
-        direction TB
-        PREBUF["30s Pre-Buffer\nCircular Recorder"]:::snn
         ANOM["Anomaly Detector\nLoitering Detection"]:::alert
-        DB[("SQLite\nForensic Log")]:::infra
-        API["FastAPI\nWebSocket Server"]:::infra
-        DASH["React Dashboard\nLive · Clips · Alerts"]:::compress
     end
 
-    C1 --> SNN
-    C2 --> SNN
-    C1 -..-> PREBUF
-    C2 -..-> PREBUF
+    subgraph SCORE_LAYER ["  Intelligence Scoring  "]
+        direction TB
+        SCORE["Frame Score\n0 to 100"]:::score
+        DEC{{"Threshold"}}:::score
+        HEAVY["Heavy Compress\nScore below 30\n15% JPEG"]:::skip
+        ROI["ROI Compress\nScore above 60\nSubject 88% / BG 12%"]:::compress
+    end
 
-    SNN -->|No Spike| SKIP
-    SNN -->|Spike| YOLO
-    SNN -..->|Motion| ANOM
+    subgraph STORE ["  Data Layer  "]
+        direction TB
+        PREBUF["Pre-Event Buffer\n30s Circular"]:::snn
+        DB[("SQLite\nForensic Log")]:::infra
+        API["FastAPI Server\nWebSocket"]:::infra
+    end
 
+    DASH["React Dashboard\nLive Feed / Clips\nAlerts / Stats"]:::compress
+
+    CAM --> SNN
+    CAM --> PREBUF
+
+    SNN -->|"No Spike"| SKIP
+    SNN -->|"Spike"| YOLO
+    SNN -->|"Anomaly"| ANOM
+
+    YOLO --> ANOM
     YOLO --> SCORE
-    YOLO -..->|Object history| ANOM
-    SCORE --> DEC
-    DEC -->|below 30| HEAVY
-    DEC -->|above 60| ROI
 
-    PREBUF -..->|Pre-event clip| DB
-    ANOM -..->|Alert| DB
-    ANOM -..->|Alert| API
+    SCORE --> DEC
+    DEC -->|"below 30"| HEAVY
+    DEC -->|"above 60"| ROI
+
+    PREBUF --> DB
+    ANOM --> DB
+    ANOM --> API
+
     ROI --> API
     HEAVY --> API
 
-    DB <-->|Query| API
-    API <-->|WebSocket| DASH
+    DB -->|"Query"| API
+    API --> DASH
 ```
 
 ---
@@ -104,9 +109,3 @@ flowchart LR
 | **SQLite** | Local forensic event database | Public Domain |
 | **zstandard (zstd)** | High-speed lossless compression for EVENT frames | BSD |
 | **py7zr** | LZMA2 batch archiving for IDLE frame sequences | LGPL-2.1 |
-
----
-
-> "The world is not enough — but it is such a perfect place to start." — James Bond
-
-All the best to every team. Build something great.
