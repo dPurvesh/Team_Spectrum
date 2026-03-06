@@ -1,4 +1,4 @@
-# VICSTA Hackathon' 26
+# VICSTA Hackathon - Grand Finale
 
 **VIT College, Kondhwa Campus | 5th – 6th March**
 
