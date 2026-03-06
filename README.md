@@ -28,62 +28,66 @@
 ## System Architecture
 
 ```mermaid
-flowchart TD
-    classDef cam    fill:#1e293b,stroke:#60a5fa,stroke-width:2px,color:#f1f5f9
-    classDef snn    fill:#2e1065,stroke:#a855f7,stroke-width:2px,color:#f1f5f9
-    classDef yolo   fill:#172554,stroke:#3b82f6,stroke-width:2px,color:#f1f5f9
-    classDef score  fill:#7c2d12,stroke:#f97316,stroke-width:2px,color:#f1f5f9
-    classDef skip   fill:#1e293b,stroke:#64748b,stroke-width:2px,color:#94a3b8
-    classDef alert  fill:#450a0a,stroke:#ef4444,stroke-width:2px,color:#f1f5f9
+%%{init: {"flowchart": {"curve": "step", "nodeSpacing": 50, "rankSpacing": 70}}}%%
+flowchart LR
+    classDef cam      fill:#1e293b,stroke:#60a5fa,stroke-width:2px,color:#f1f5f9
+    classDef snn      fill:#2e1065,stroke:#a855f7,stroke-width:2px,color:#f1f5f9
+    classDef yolo     fill:#172554,stroke:#3b82f6,stroke-width:2px,color:#f1f5f9
+    classDef score    fill:#7c2d12,stroke:#f97316,stroke-width:2px,color:#f1f5f9
+    classDef skip     fill:#1e293b,stroke:#64748b,stroke-width:2px,color:#94a3b8
+    classDef alert    fill:#450a0a,stroke:#ef4444,stroke-width:2px,color:#f1f5f9
     classDef compress fill:#064e3b,stroke:#10b981,stroke-width:2px,color:#f1f5f9
-    classDef infra  fill:#0f172a,stroke:#38bdf8,stroke-width:2px,color:#f1f5f9
+    classDef infra    fill:#0f172a,stroke:#38bdf8,stroke-width:2px,color:#f1f5f9
 
-    CAM["Multi-Camera Input\nWebcam / IP / RTSP"]:::cam
+    subgraph INPUT ["Input"]
+        direction TB
+        C1["Camera 1\nWebcam / USB"]:::cam
+        C2["Camera 2\nIP / RTSP"]:::cam
+    end
 
-    subgraph EDGE ["Edge Processing Pipeline"]
+    subgraph PIPELINE ["Edge Processing Pipeline"]
         direction TB
         SNN["SNN Spike Gate\nSkips 80% of idle frames"]:::snn
-        YOLO["YOLOv8-nano\nObject Detection on Spike"]:::yolo
-        SCORE["Frame Intelligence Score\n0 - 100"]:::score
-        DEC{{"Score Threshold"}}:::score
-        HEAVY["Heavy Compress\nScore below 30 — 15% JPEG"]:::skip
-        ROI["ROI Compression\nScore above 60 — Subject 88%, BG 12%"]:::compress
         SKIP["Skip Frame\nZero Compute"]:::skip
-        ANOM["Anomaly Detector\nLoitering Detection"]:::alert
+        YOLO["YOLOv8-nano\nObject Detection"]:::yolo
+        SCORE["Frame Intelligence Score\n0 to 100"]:::score
+        DEC{{"Score?"}}:::score
+        HEAVY["Heavy Compress\nBelow 30 — 15% JPEG"]:::skip
+        ROI["ROI Compression\nAbove 60 — Subject 88% · BG 12%"]:::compress
     end
 
-    PREBUF["Pre-Event Recorder\n30s Circular Buffer"]:::snn
-
-    subgraph SERVE ["Data Layer & Dashboard"]
+    subgraph INFRA ["Data Layer and Dashboard"]
         direction TB
-        DB[("SQLite Forensic Log\nEvents, Alerts, Metrics")]:::infra
-        API["FastAPI App Server\nWebSocket Stream"]:::infra
-        DASH["React Dashboard\nLive Feed / Clips / Compression / Alerts"]:::compress
+        PREBUF["30s Pre-Buffer\nCircular Recorder"]:::snn
+        ANOM["Anomaly Detector\nLoitering Detection"]:::alert
+        DB[("SQLite\nForensic Log")]:::infra
+        API["FastAPI\nWebSocket Server"]:::infra
+        DASH["React Dashboard\nLive · Clips · Alerts"]:::compress
     end
 
-    CAM -->|"15 fps"| SNN
-    CAM -..->|"Always running"| PREBUF
+    C1 --> SNN
+    C2 --> SNN
+    C1 -..-> PREBUF
+    C2 -..-> PREBUF
 
-    SNN -->|"No spike"| SKIP
-    SNN -->|"Spike"| YOLO
-    SNN -..->|"Motion detected"| ANOM
+    SNN -->|No Spike| SKIP
+    SNN -->|Spike| YOLO
+    SNN -..->|Motion| ANOM
 
-    YOLO -->|"Object history"| ANOM
     YOLO --> SCORE
+    YOLO -..->|Object history| ANOM
     SCORE --> DEC
+    DEC -->|below 30| HEAVY
+    DEC -->|above 60| ROI
 
-    DEC -->|"below 30"| HEAVY
-    DEC -->|"above 60 EVENT"| ROI
-
-    PREBUF -..->|"Pre-event clip"| DB
-    ANOM -..->|"Alert"| DB
-    ANOM -..->|"Alert"| API
-
+    PREBUF -..->|Pre-event clip| DB
+    ANOM -..->|Alert| DB
+    ANOM -..->|Alert| API
     ROI --> API
     HEAVY --> API
 
-    DB <-->|"Query / Serve"| API
-    API <-->|"Live data"| DASH
+    DB <-->|Query| API
+    API <-->|WebSocket| DASH
 ```
 
 ---
