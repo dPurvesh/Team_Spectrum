@@ -1,4 +1,4 @@
-# VICSTA Hackathon – Grand Finale
+# VICSTA Hackathon' 26
 
 **VIT College, Kondhwa Campus | 5th – 6th March**
 
@@ -8,7 +8,7 @@
 
 - **Team Name:** Team Spectrum
 - **Members:**
-  - Veer Gandhi (Team Leader)
+  - Veer Gandhi
   - Sanchit Borikar
   - Purvesh Didpaye
   - Ashraf Ahmed
