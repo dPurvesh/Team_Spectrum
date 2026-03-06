@@ -43,37 +43,41 @@ flowchart LR
     classDef compress fill:#dcfce7,stroke:#16a34a,stroke-width:2px,color:#14532d
     classDef infra    fill:#e0f2fe,stroke:#0284c7,stroke-width:2px,color:#0c4a6e
 
-    CAM["Camera Input\nWebcam / RTSP / IP"]:::cam
-    PREBUF["Pre-Event Buffer\n30s Circular"]:::snn
-    SNN["SNN Spike Gate\nSkips 80% idle frames"]:::snn
-    SKIP["Skip Frame\nZero Compute"]:::skip
-    YOLO["YOLOv8-nano\nObject Detection"]:::yolo
-    ANOM["Anomaly Detector\nLoitering Detection"]:::alert
-    SCORE["Frame Score\n0 to 100"]:::score
-    DEC{{"Threshold"}}:::score
-    HEAVY["Heavy Compress\nScore below 30\n15% JPEG"]:::skip
-    ROI["ROI Compress\nScore above 60\nSubject 88% / BG 12%"]:::compress
-    DB[("SQLite\nForensic Log")]:::infra
-    API["FastAPI Server\nWebSocket"]:::infra
-    DASH["React Dashboard\nLive Feed / Clips / Alerts"]:::compress
+    subgraph CANVAS[" "]
+        CAM["Camera Input\nWebcam / RTSP / IP"]:::cam
+        PREBUF["Pre-Event Buffer\n30s Circular"]:::snn
+        SNN["SNN Spike Gate\nSkips 80% idle frames"]:::snn
+        SKIP["Skip Frame\nZero Compute"]:::skip
+        YOLO["YOLOv8-nano\nObject Detection"]:::yolo
+        ANOM["Anomaly Detector\nLoitering Detection"]:::alert
+        SCORE["Frame Score\n0 to 100"]:::score
+        DEC{{"Threshold"}}:::score
+        HEAVY["Heavy Compress\nScore below 30\n15% JPEG"]:::skip
+        ROI["ROI Compress\nScore above 60\nSubject 88% / BG 12%"]:::compress
+        DB[("SQLite\nForensic Log")]:::infra
+        API["FastAPI Server\nWebSocket"]:::infra
+        DASH["React Dashboard\nLive Feed / Clips / Alerts"]:::compress
 
-    CAM --> SNN
-    CAM --> PREBUF
-    SNN -->|"No Spike"| SKIP
-    SNN -->|"Spike"| YOLO
-    SNN -->|"Anomaly"| ANOM
-    YOLO --> ANOM
-    YOLO --> SCORE
-    SCORE --> DEC
-    DEC -->|"below 30"| HEAVY
-    DEC -->|"above 60"| ROI
-    PREBUF --> DB
-    ANOM --> DB
-    ANOM --> API
-    ROI --> API
-    HEAVY --> API
-    DB -->|"Query"| API
-    API --> DASH
+        CAM --> SNN
+        CAM --> PREBUF
+        SNN -->|"No Spike"| SKIP
+        SNN -->|"Spike"| YOLO
+        SNN -->|"Anomaly"| ANOM
+        YOLO --> ANOM
+        YOLO --> SCORE
+        SCORE --> DEC
+        DEC -->|"below 30"| HEAVY
+        DEC -->|"above 60"| ROI
+        PREBUF --> DB
+        ANOM --> DB
+        ANOM --> API
+        ROI --> API
+        HEAVY --> API
+        DB -->|"Query"| API
+        API --> DASH
+    end
+
+    style CANVAS fill:#ffffff,stroke:#e2e8f0,stroke-width:2px
 ```
 
 ---
