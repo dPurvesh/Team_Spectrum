@@ -1,28 +1,44 @@
-# Python
+# ============================================================
+#  EdgeVid LowBand — .gitignore
+# ============================================================
+
+# Python bytecode
 __pycache__/
 *.py[cod]
 *.egg-info/
-backend/venv/
 
-# Storage (generated at runtime)
+# Virtual environments
+backend/venv/
+venv/
+env/
+
+# Runtime storage (all generated data — never commit)
 backend/storage/
+storage/
 *.db
+*.csv
 *.7z
 *.zst
 
-# YOLO model weights (large, downloaded automatically)
+# YOLO model weights (large binary — auto-downloaded on first run)
 backend/yolov8n.pt
+yolov8n.pt
 
-# Node
+# Node / React
 frontend/edgevid-dashboard/node_modules/
 frontend/edgevid-dashboard/build/
 
-# OS
+# OS artifacts
 .DS_Store
 Thumbs.db
 desktop.ini
 
-# IDE
+# IDE / Editor
 .vscode/
 .idea/
 *.swp
+*.swo
+
+# Logs
+*.log
+npm-debug.log*
