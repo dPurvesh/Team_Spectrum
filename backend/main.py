@@ -15,6 +15,11 @@ import numpy as np
 from datetime import datetime
 from contextlib import asynccontextmanager
 
+# Suppress OpenCV warnings (DirectShow detection errors, OpenH264 warnings)
+os.environ["OPENCV_VIDEOIO_DEBUG"] = "0"
+os.environ["OPENCV_VIDEOIO_PRIORITY_MSMF"] = "0"  # Prefer DirectShow over MSMF
+os.environ["OPENCV_LOG_LEVEL"] = "SILENT"  # Suppress OpenCV logs
+
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse, FileResponse
@@ -50,26 +55,60 @@ ws_clients = set()
 # THREADED CAMERA READER — Prevents cap.read() from blocking
 # ============================================================
 class CameraReader:
-    """Read camera frames in a dedicated thread so cap.read() never blocks the pipeline."""
+    """Read camera frames in a dedicated thread so cap.read() never blocks the pipeline.
+    Supports both local cameras (int index) and network streams (URL string)."""
+    
     def __init__(self, source=0):
-        self.cap = cv2.VideoCapture(source, cv2.CAP_DSHOW)
-        if not self.cap.isOpened():
-            print(f"⚠️ DSHOW failed for source {source}, trying default backend...")
+        self.source = source
+        self.is_network = isinstance(source, str)
+        
+        if self.is_network:
+            # Network camera (DroidCam, IP Webcam, RTSP, etc.)
+            print(f"📡 Connecting to network camera: {source}")
             self.cap = cv2.VideoCapture(source)
-        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            # Set buffer size small to reduce latency
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            # Timeout for network streams
+            self.cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000)
+            self.cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 5000)
+        else:
+            # Local camera
+            self.cap = cv2.VideoCapture(source, cv2.CAP_DSHOW)
+            if not self.cap.isOpened():
+                print(f"⚠️ DSHOW failed for source {source}, trying default backend...")
+                self.cap = cv2.VideoCapture(source)
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        
         self._frame = None
         self._ret = False
         self._lock = threading.Lock()
         self._running = True
+        self._connected = self.cap.isOpened()
+        self._last_frame_time = time.time()
         self._thread = threading.Thread(target=self._reader_loop, daemon=True)
         self._thread.start()
 
     def _reader_loop(self):
+        reconnect_delay = 1.0
         while self._running:
+            if not self.cap.isOpened() and self.is_network:
+                # Try to reconnect for network cameras
+                print(f"🔄 Reconnecting to {self.source}...")
+                time.sleep(reconnect_delay)
+                self.cap = cv2.VideoCapture(self.source)
+                self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                reconnect_delay = min(reconnect_delay * 2, 10.0)  # Exponential backoff
+                continue
+            
             ret, frame = self.cap.read()
             with self._lock:
                 self._ret = ret
-                self._frame = frame
+                if ret:
+                    self._frame = frame
+                    self._last_frame_time = time.time()
+                    self._connected = True
+                    reconnect_delay = 1.0  # Reset backoff on success
+            
             if not ret:
                 time.sleep(0.01)
 
@@ -80,7 +119,12 @@ class CameraReader:
             return False, None
 
     def isOpened(self):
-        return self.cap.isOpened()
+        return self.cap.isOpened() and self._connected
+
+    def is_stale(self, timeout=5.0):
+        """Check if no frames received for timeout seconds (network camera health)."""
+        with self._lock:
+            return (time.time() - self._last_frame_time) > timeout
 
     def release(self):
         self._running = False
@@ -91,38 +135,48 @@ class CameraReader:
 # ============================================================
 # CAMERA DETECTION — Probe for available cameras
 # ============================================================
+# Cache for camera detection results
+_camera_cache = {'cameras': [], 'timestamp': 0}
+_CACHE_TTL = 30  # seconds
+
 def _is_bad_camera(cap):
     """Returns True if camera should be excluded:
     - IR/Windows Hello cameras (near-grayscale output)
     - Broken/virtual cameras outputting random noise (high inter-frame diff)
     """
     try:
-        # Flush the buffer
-        for _ in range(5):
+        # Flush the buffer (reduced from 5 to 2 for speed)
+        for _ in range(2):
             cap.read()
         ret1, frame1 = cap.read()
         if not ret1 or frame1 is None:
             return True
 
         # --- IR check: all channels nearly identical (grayscale output) ---
+        # Real IR cameras have diff < 2-3. Normal cameras in low light can have
+        # diff around 3-8, so we use threshold of 3 to avoid false positives.
         b, g, r = cv2.split(frame1)
         diff_rg = float(np.mean(np.abs(r.astype(np.int16) - g.astype(np.int16))))
         diff_rb = float(np.mean(np.abs(r.astype(np.int16) - b.astype(np.int16))))
-        if diff_rg < 8 and diff_rb < 8:
-            print(f"  → IR/grayscale camera detected (diff_rg={diff_rg:.1f}, diff_rb={diff_rb:.1f})")
+        
+        # Also check standard deviation - real color images have variance
+        std_check = float(np.std(frame1))
+        
+        # Only filter if BOTH color diffs are tiny AND std is low (true IR)
+        if diff_rg < 3 and diff_rb < 3 and std_check < 15:
+            print(f"  → IR/grayscale camera detected (diff_rg={diff_rg:.1f}, diff_rb={diff_rb:.1f}, std={std_check:.1f})")
             return True
 
-        # --- Noise check: compare two consecutive frames 80ms apart ---
-        # A broken/virtual camera outputting random static will have very high
-        # inter-frame difference (pure noise changes completely every frame).
-        # Real cameras, even with motion, stay below ~20 mean-abs-diff.
+        # --- Noise check: compare two consecutive frames 50ms apart (reduced from 80ms) ---
+        # Threshold of 35 allows for auto-exposure adjustments and minor scene changes
+        # True noise/broken cameras typically have diff > 50
         import time as _time
-        _time.sleep(0.08)
+        _time.sleep(0.05)
         ret2, frame2 = cap.read()
         if not ret2 or frame2 is None:
             return True
         inter_frame_diff = float(np.mean(np.abs(frame1.astype(np.int16) - frame2.astype(np.int16))))
-        if inter_frame_diff > 25:
+        if inter_frame_diff > 40:
             print(f"  → Noisy/broken camera detected (inter-frame diff={inter_frame_diff:.1f})")
             return True
 
@@ -131,35 +185,80 @@ def _is_bad_camera(cap):
         return False
 
 
-def detect_available_cameras(max_check=5):
-    """Probe camera indices 0-4 to find all unique connected cameras.
-    Filters out Windows virtual duplicates AND IR/Windows Hello cameras."""
-    # Step 1: Find all indices that can produce a frame
-    candidates = []
-    for i in range(max_check):
-        try:
-            cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)
-            if cap.isOpened():
-                ret, _ = cap.read()
-                if ret:
-                    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                    # Skip IR or noisy/broken cameras
-                    if _is_bad_camera(cap):
-                        print(f"⚠️ Camera index {i} is IR/noisy/broken — skipped")
-                        cap.release()
-                        continue
-                    candidates.append({
-                        'index': i,
-                        'cam_id': f'cam_{i}',
-                        'name': 'Built-in Camera' if i == 0 else f'External Camera {i}',
-                        'resolution': f'{w}x{h}',
-                    })
+def _probe_single_camera(index):
+    """Probe a single camera index with timeout. Returns camera info or None."""
+    try:
+        cap = cv2.VideoCapture(index, cv2.CAP_DSHOW)
+        if not cap.isOpened():
+            return None
+        
+        # Set timeout properties for faster failure
+        cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 2000)
+        cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 2000)
+        
+        ret, _ = cap.read()
+        if not ret:
             cap.release()
-        except Exception:
-            pass
+            return None
+            
+        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        
+        # Skip IR or noisy/broken cameras
+        if _is_bad_camera(cap):
+            print(f"⚠️ Camera index {index} is IR/noisy/broken — skipped")
+            cap.release()
+            return None
+            
+        cap.release()
+        return {
+            'index': index,
+            'cam_id': f'cam_{index}',
+            'name': 'Built-in Camera' if index == 0 else f'External Camera {index}',
+            'resolution': f'{w}x{h}',
+        }
+    except Exception as e:
+        print(f"⚠️ Camera index {index} probe failed: {e}")
+        return None
+
+
+def detect_available_cameras(max_check=5, use_cache=True):
+    """Probe camera indices 0-4 to find all unique connected cameras.
+    Filters out Windows virtual duplicates AND IR/Windows Hello cameras.
+    Uses caching to avoid repeated slow probes."""
+    global _camera_cache
+    
+    # Return cached result if still valid
+    if use_cache and _camera_cache['cameras'] and (time.time() - _camera_cache['timestamp'] < _CACHE_TTL):
+        print(f"📷 Returning cached camera list ({len(_camera_cache['cameras'])} cameras)")
+        return _camera_cache['cameras']
+    
+    # Suppress OpenCV/DirectShow warnings during detection
+    import warnings
+    warnings.filterwarnings("ignore")
+    
+    print(f"📷 Probing camera indices 0-{max_check-1}...")
+    
+    # Step 1: Parallel probe all indices (faster than sequential)
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
+    candidates = []
+    
+    with ThreadPoolExecutor(max_workers=max_check) as executor:
+        futures = {executor.submit(_probe_single_camera, i): i for i in range(max_check)}
+        for future in futures:
+            try:
+                result = future.result(timeout=5)  # 5 second timeout per camera
+                if result:
+                    candidates.append(result)
+            except FuturesTimeout:
+                print(f"⚠️ Camera index {futures[future]} timed out — skipped")
+            except Exception as e:
+                print(f"⚠️ Camera probe error: {e}")
 
     if len(candidates) <= 1:
+        # Cache and return
+        _camera_cache = {'cameras': candidates, 'timestamp': time.time()}
+        print(f"📷 Found {len(candidates)} camera(s)")
         return candidates
 
     # Step 2: Open all candidates simultaneously to detect duplicates.
@@ -187,6 +286,9 @@ def detect_available_cameras(max_check=5):
     for c in caps.values():
         c.release()
 
+    # Cache the result
+    _camera_cache = {'cameras': unique, 'timestamp': time.time()}
+    print(f"📷 Found {len(unique)} unique camera(s)")
     return unique
 
 
@@ -292,21 +394,51 @@ class CameraInstance:
         self.state['last_detections'] = []
         self.state['last_det_frame'] = 0
 
+    def _sanitize_session_name(self, name):
+        """Sanitize session name for safe filesystem paths."""
+        if not name:
+            return None
+        # Remove/replace unsafe characters
+        import re
+        safe = re.sub(r'[\\/:*?"<>|]', '_', name)
+        safe = re.sub(r'\s+', '_', safe)
+        return safe[:50]  # Limit length
+
     def _start_event_clip(self, frame, frame_number, category='EVENT'):
         h, w = frame.shape[:2]
         self.clip_state['frame_shape'] = (w, h)
         ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-        filename = f"clip_{self.cam_id}_{category}_{frame_number}_{ts}.mp4"
-        filepath = os.path.join("storage", "clips", filename)
-        # Try H.264 (avc1) first — browser-compatible; fall back to mp4v
-        fourcc = cv2.VideoWriter_fourcc(*'avc1')
+        
+        # Get sanitized session name
+        session = self._sanitize_session_name(self.state.get('session_name'))
+        
+        # Build filename with session prefix if available
+        if session:
+            filename = f"{session}_clip_{self.cam_id}_{category}_{frame_number}_{ts}.mp4"
+            # Create session folder
+            clip_dir = os.path.join("storage", "clips", session)
+        else:
+            filename = f"clip_{self.cam_id}_{category}_{frame_number}_{ts}.mp4"
+            clip_dir = os.path.join("storage", "clips")
+        
+        os.makedirs(clip_dir, exist_ok=True)
+        filepath = os.path.join(clip_dir, filename)
+        
+        # Use mp4v codec (MPEG-4) - reliable on all platforms, browser playable
+        # Avoid avc1/H264 which requires OpenH264 library that may not be installed
         write_fps = 15.0 if category == 'EVENT' else 12.0 if category == 'NORMAL' else 8.0
-        test_writer = cv2.VideoWriter(filepath, fourcc, write_fps, (w, h))
-        if not test_writer.isOpened():
-            test_writer.release()
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            test_writer = cv2.VideoWriter(filepath, fourcc, write_fps, (w, h))
-        self.clip_state['writer'] = test_writer
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        writer = cv2.VideoWriter(filepath, fourcc, write_fps, (w, h))
+        
+        if not writer.isOpened():
+            # Final fallback to MJPG if mp4v fails
+            writer.release()
+            filename = filename.replace('.mp4', '.avi')
+            filepath = os.path.join("storage", "clips", filename)
+            fourcc = cv2.VideoWriter_fourcc(*'MJPG')
+            writer = cv2.VideoWriter(filepath, fourcc, write_fps, (w, h))
+        
+        self.clip_state['writer'] = writer
         self.clip_state['path'] = filepath
         self.clip_state['start_frame'] = frame_number
         self.clip_state['cooldown'] = 0
@@ -518,7 +650,8 @@ class CameraInstance:
 
                 if category == "EVENT":
                     if frame_number % 3 == 0:
-                        frame_path, _, _ = compressor.compress_event(frame, detections, frame_number)
+                        result = compressor.compress_event(frame, detections, frame_number, score)
+                        frame_path = result['filepath'] if result else None
                     else:
                         frame_path = None
                     if frame_number % 10 == 0:
@@ -527,7 +660,8 @@ class CameraInstance:
                             category=category, detections=detections,
                             event_type="PERSON_DETECTED", severity="HIGH",
                             frame_path=frame_path, compression_type="zstd+roi",
-                            camera_id=self.cam_id
+                            camera_id=self.cam_id,
+                            session_name=self.state.get('session_name')
                         )
                     if self.clip_state['writer'] is None:
                         self._start_event_clip(frame, frame_number, category='EVENT')
@@ -561,7 +695,8 @@ class CameraInstance:
                         anomaly_flag=True, duration=alert.get('duration_sec', 0),
                         prebuffer_path=prebuf_info['filepath'] if prebuf_info else None,
                         compression_type="zstd+roi",
-                        camera_id=self.cam_id
+                        camera_id=self.cam_id,
+                        session_name=self.state.get('session_name')
                     )
                     database.log_alert(event_id, alert['type'], alert['message'])
                     self.state['last_alert'] = alert
@@ -749,6 +884,13 @@ if os.path.isdir(_BUILD_DIR):
 
 # ---- REST Endpoints ----
 
+# Catch-all for /api/v1/* requests (browser extensions, etc.)
+@app.get("/api/v1/{path:path}")
+def api_v1_catchall(path: str):
+    """Handle requests to non-existent API v1 endpoints (browser extensions)."""
+    return {"error": "API v1 not available", "version": "2.0.0"}
+
+
 @app.get("/")
 def root():
     active = [cid for cid, c in cameras.items() if c.state['running']]
@@ -761,14 +903,15 @@ def root():
 
 
 @app.get("/api/cameras/detect")
-def api_detect_cameras():
-    """Probe for all available cameras connected to this device."""
-    available = detect_available_cameras()
+def api_detect_cameras(refresh: bool = False):
+    """Probe for all available cameras connected to this device.
+    Use ?refresh=true to bypass cache and force a fresh scan."""
+    available = detect_available_cameras(use_cache=not refresh)
     for cam in available:
         cam_id = f"cam_{cam['index']}"
         cam['cam_id'] = cam_id
         cam['active'] = cam_id in cameras and cameras[cam_id].state['running']
-    return {"cameras": available, "count": len(available)}
+    return {"cameras": available, "count": len(available), "cached": not refresh}
 
 
 @app.get("/api/cameras")
@@ -863,9 +1006,100 @@ def camera_start(source: int = 0, session_name: str = None):
             return {"status": "already_running", "cam_id": cam_id}
         cam = CameraInstance(cam_id, source)
         cameras[cam_id] = cam
+    # Reset compression stats so every new session starts at 0
+    compressor.reset_stats()
+    compressor.idle_batch.clear()
     cam.start(session_name)
     return {"status": "started", "cam_id": cam_id, "source": source,
             "session": cam.state['session_name']}
+
+
+@app.post("/api/cameras/connect")
+def connect_network_camera(
+    camera_id: str,
+    ip_address: str,
+    port: str,
+    path: str = "/video",
+    session_name: str = None
+):
+    """
+    Connect a network camera (DroidCam, IP Webcam, RTSP, etc.).
+    Non-blocking: spawns camera reader in daemon thread.
+    
+    Args:
+        camera_id: Unique identifier (e.g., "CAM-02", "phone_cam")
+        ip_address: IP address of the camera (e.g., "192.168.1.5")
+        port: Port number (e.g., "4747" for DroidCam)
+        path: URL path (default "/video", use "/mjpegfeed" for IP Webcam app)
+    """
+    # Sanitize camera_id
+    cam_id = camera_id.lower().replace(" ", "_").replace("-", "_")
+    if not cam_id:
+        return JSONResponse(
+            {"status": "error", "message": "camera_id is required"},
+            status_code=400
+        )
+    
+    # Check if already exists
+    with cameras_lock:
+        if cam_id in cameras:
+            if cameras[cam_id].state['running']:
+                return {"status": "already_running", "cam_id": cam_id}
+            else:
+                # Remove old instance
+                try:
+                    cameras[cam_id].stop()
+                except:
+                    pass
+                del cameras[cam_id]
+    
+    # Construct stream URL
+    # DroidCam: http://{ip}:{port}/video
+    # IP Webcam: http://{ip}:{port}/video or /mjpegfeed
+    # RTSP: rtsp://{ip}:{port}/stream
+    stream_url = f"http://{ip_address}:{port}{path}"
+    
+    print(f"📡 Connecting network camera: {cam_id} -> {stream_url}")
+    
+    # Create camera instance with URL source (non-blocking)
+    try:
+        with cameras_lock:
+            cam = CameraInstance(cam_id, stream_url)
+            cameras[cam_id] = cam
+
+        # Reset compression stats so every new session starts at 0
+        compressor.reset_stats()
+        compressor.idle_batch.clear()
+        # Start pipeline in background thread
+        session = session_name or f"Network_{datetime.now().strftime('%H%M%S')}"
+        cam.start(session)
+        
+        return {
+            "status": "started",
+            "cam_id": cam_id,
+            "stream_url": stream_url,
+            "session": cam.state['session_name'],
+            "message": f"Network camera {cam_id} connected"
+        }
+    except Exception as e:
+        return JSONResponse(
+            {"status": "error", "message": str(e)},
+            status_code=500
+        )
+
+
+@app.delete("/api/cameras/{cam_id}")
+def disconnect_camera(cam_id: str):
+    """Disconnect and remove a camera from the registry."""
+    if cam_id in cameras:
+        cameras[cam_id].stop()
+        with cameras_lock:
+            del cameras[cam_id]
+        return {"status": "disconnected", "cam_id": cam_id}
+    return JSONResponse(
+        {"status": "error", "message": f"Camera {cam_id} not found"},
+        status_code=404
+    )
 
 
 @app.post("/api/camera/stop")
@@ -898,65 +1132,90 @@ def list_clips(response: Response):
     clips_dir = "storage/clips"
     if not os.path.exists(clips_dir):
         return {"clips": []}
+
+    # Collect all (dirpath, filename) pairs recursively so session subdirs work
+    all_mp4 = []
+    for dirpath, _dirs, filenames in os.walk(clips_dir):
+        for fname in filenames:
+            if fname.endswith('.mp4'):
+                all_mp4.append((dirpath, fname))
+    # Sort newest first by filename (timestamp embedded in name)
+    all_mp4.sort(key=lambda x: x[1], reverse=True)
+
     clips = []
-    for f in sorted(os.listdir(clips_dir), reverse=True):
-        if f.endswith('.mp4'):
-            fpath = os.path.join(clips_dir, f)
-            size_kb = os.path.getsize(fpath) / 1024
-            meta_path = fpath.replace('.mp4', '.json')
-            meta = {}
-            if os.path.exists(meta_path):
-                try:
-                    with open(meta_path, 'r') as mf:
-                        meta = json.load(mf)
-                except Exception:
-                    pass
-            parts = f.replace('.mp4', '').split('_')
-            timestamp_str = ''
-            cat_from_name = 'EVENT'
-            cam_from_name = ''
+    for dirpath, f in all_mp4:
+        fpath = os.path.join(dirpath, f)
+        size_kb = os.path.getsize(fpath) / 1024
+        meta_path = fpath.replace('.mp4', '.json')
+        meta = {}
+        if os.path.exists(meta_path):
             try:
-                if f.startswith('clip_cam_'):
-                    # New: clip_cam_0_EVENT_123_20260305_120000.mp4
-                    cam_from_name = f"cam_{parts[2]}"
-                    cat_from_name = parts[3]
-                    timestamp_str = f"{parts[5]}_{parts[6]}"
-                elif f.startswith('clip_'):
-                    cat_from_name = parts[1]
-                    timestamp_str = f"{parts[3]}_{parts[4]}"
-                else:
-                    timestamp_str = f"{parts[3]}_{parts[4]}"
-            except (IndexError, ValueError):
+                with open(meta_path, 'r') as mf:
+                    meta = json.load(mf)
+            except Exception:
                 pass
-            readable_time = meta.get('start_time', '')
-            if not readable_time and timestamp_str:
-                try:
-                    dt = datetime.strptime(timestamp_str, '%Y%m%d_%H%M%S')
-                    readable_time = dt.isoformat()
-                except ValueError:
-                    readable_time = ''
-            category = meta.get('category', cat_from_name)
-            quality = meta.get('quality', 'HD' if category == 'EVENT' else 'MEDIUM' if category == 'NORMAL' else 'LOW')
-            clips.append({
-                "filename": f,
-                "size_kb": round(size_kb, 1),
-                "category": category,
-                "quality": quality,
-                "camera": meta.get('camera', cam_from_name or 'cam_0'),
-                "fps": meta.get('fps', 15),
-                "duration_sec": meta.get('duration_sec', round(size_kb / 50, 1)),
-                "start_time": readable_time,
-                "end_time": meta.get('end_time', ''),
-            })
+        parts = f.replace('.mp4', '').split('_')
+        timestamp_str = ''
+        cat_from_name = 'EVENT'
+        cam_from_name = ''
+        try:
+            if f.startswith('clip_cam_'):
+                # clip_cam_0_EVENT_123_20260305_120000.mp4
+                cam_from_name = f"cam_{parts[2]}"
+                cat_from_name = parts[3]
+                timestamp_str = f"{parts[5]}_{parts[6]}"
+            elif '_clip_cam_' in f:
+                # Session-prefixed: Demo_004058_clip_cam_0_EVENT_123_20260305_120000.mp4
+                idx = parts.index('clip') if 'clip' in parts else -1
+                if idx >= 0 and len(parts) > idx + 6:
+                    cam_from_name = f"cam_{parts[idx+2]}"
+                    cat_from_name = parts[idx+3]
+                    timestamp_str = f"{parts[-2]}_{parts[-1]}"
+            elif f.startswith('clip_'):
+                cat_from_name = parts[1]
+                timestamp_str = f"{parts[3]}_{parts[4]}"
+            else:
+                if len(parts) >= 5:
+                    timestamp_str = f"{parts[-2]}_{parts[-1]}"
+        except (IndexError, ValueError):
+            pass
+        readable_time = meta.get('start_time', '')
+        if not readable_time and timestamp_str:
+            try:
+                dt = datetime.strptime(timestamp_str, '%Y%m%d_%H%M%S')
+                readable_time = dt.isoformat()
+            except ValueError:
+                readable_time = ''
+        category = meta.get('category', cat_from_name)
+        quality = meta.get('quality', 'HD' if category == 'EVENT' else 'MEDIUM' if category == 'NORMAL' else 'LOW')
+        # Store relative path from clips_dir so the download endpoint can find it
+        rel_path = os.path.relpath(fpath, clips_dir).replace('\\', '/')
+        clips.append({
+            "filename": rel_path,      # may include subdir, e.g. "Demo_004058/clip_...mp4"
+            "size_kb": round(size_kb, 1),
+            "category": category,
+            "quality": quality,
+            "camera": meta.get('camera', cam_from_name or 'cam_0'),
+            "fps": meta.get('fps', 15),
+            "duration_sec": meta.get('duration_sec', round(size_kb / 50, 1)),
+            "start_time": readable_time,
+            "end_time": meta.get('end_time', ''),
+        })
+    # Sort newest-first by start_time (ISO string, empty string sorts to end)
+    clips.sort(key=lambda c: c['start_time'] or '', reverse=True)
     return {"clips": clips, "count": len(clips)}
 
 
-@app.get("/api/clips/{filename}")
+@app.get("/api/clips/{filename:path}")
 def download_clip(filename: str):
-    safe = os.path.basename(filename)
-    filepath = os.path.join("storage", "clips", safe)
-    if os.path.exists(filepath):
-        return FileResponse(filepath, media_type="video/mp4", filename=safe)
+    # filename may be a relative path like "Demo_004058/clip_cam_0_...mp4"
+    # Sanitize: resolve within clips dir only (prevent path traversal)
+    clips_dir = os.path.abspath("storage/clips")
+    target = os.path.abspath(os.path.join(clips_dir, filename))
+    if not target.startswith(clips_dir):
+        return JSONResponse({"error": "invalid path"}, status_code=400)
+    if os.path.exists(target):
+        return FileResponse(target, media_type="video/mp4", filename=os.path.basename(target))
     return JSONResponse({"error": "not found"}, status_code=404)
 
 
@@ -967,7 +1226,8 @@ def list_prebuffer(response: Response):
     if not os.path.exists(pb_dir):
         return {"prebuffer": []}
     items = []
-    for f in sorted(os.listdir(pb_dir), reverse=True):
+    import re as _re
+    for f in os.listdir(pb_dir):
         if f.endswith('.avi'):
             fpath = os.path.join(pb_dir, f)
             size_kb = os.path.getsize(fpath) / 1024
@@ -977,7 +1237,6 @@ def list_prebuffer(response: Response):
             event_type = 'UNKNOWN'
             readable_time = ''
             try:
-                import re as _re
                 m = _re.search(r'_(\d{8})_(\d{6})$', stem)
                 if m:
                     ts_str = f"{m.group(1)}_{m.group(2)}"
@@ -996,6 +1255,8 @@ def list_prebuffer(response: Response):
                 "start_time": readable_time,
                 "duration_sec": round(size_kb / 40, 1),
             })
+    # Sort newest-first by parsed start_time ISO string
+    items.sort(key=lambda x: x['start_time'] or '', reverse=True)
     return {"prebuffer": items, "count": len(items)}
 
 
@@ -1022,6 +1283,115 @@ def clear_session():
     return {"status": "cleared", "timestamp": datetime.now().isoformat()}
 
 
+@app.delete("/api/clips/clear")
+def clear_clips():
+    """Delete all recorded clips from storage."""
+    clips_dir = "storage/clips"
+    deleted = 0
+    if os.path.exists(clips_dir):
+        for f in os.listdir(clips_dir):
+            try:
+                os.remove(os.path.join(clips_dir, f))
+                deleted += 1
+            except Exception:
+                pass
+    return {"status": "cleared", "deleted": deleted}
+
+
+@app.delete("/api/prebuffer/clear")
+def clear_prebuffer():
+    """Delete all pre-buffer recordings from storage."""
+    pb_dir = "storage/prebuffer"
+    deleted = 0
+    if os.path.exists(pb_dir):
+        for f in os.listdir(pb_dir):
+            try:
+                os.remove(os.path.join(pb_dir, f))
+                deleted += 1
+            except Exception:
+                pass
+    return {"status": "cleared", "deleted": deleted}
+
+
+@app.delete("/api/events/clear")
+def clear_events():
+    """Delete all forensic events from database."""
+    cursor = database.conn.cursor()
+    cursor.execute("DELETE FROM events")
+    database.conn.commit()
+    return {"status": "cleared"}
+
+
+@app.delete("/api/alerts/clear")
+def clear_alerts():
+    """Delete all alerts from database."""
+    cursor = database.conn.cursor()
+    cursor.execute("DELETE FROM alerts")
+    database.conn.commit()
+    return {"status": "cleared"}
+
+
+@app.delete("/api/all/clear")
+def clear_all_data():
+    """Delete ALL data: clips, prebuffer, events, alerts - PERMANENT."""
+    results = {}
+    
+    # Clear database
+    cursor = database.conn.cursor()
+    cursor.execute("DELETE FROM events")
+    cursor.execute("DELETE FROM alerts")
+    cursor.execute("DELETE FROM system_stats")
+    database.conn.commit()
+    results["database"] = "cleared"
+    
+    # Clear clips
+    clips_dir = "storage/clips"
+    clip_count = 0
+    if os.path.exists(clips_dir):
+        for f in os.listdir(clips_dir):
+            try:
+                os.remove(os.path.join(clips_dir, f))
+                clip_count += 1
+            except Exception:
+                pass
+    results["clips_deleted"] = clip_count
+    
+    # Clear prebuffer
+    pb_dir = "storage/prebuffer"
+    pb_count = 0
+    if os.path.exists(pb_dir):
+        for f in os.listdir(pb_dir):
+            try:
+                os.remove(os.path.join(pb_dir, f))
+                pb_count += 1
+            except Exception:
+                pass
+    results["prebuffer_deleted"] = pb_count
+    
+    # Clear events folder
+    events_dir = "storage/events"
+    ev_count = 0
+    if os.path.exists(events_dir):
+        for f in os.listdir(events_dir):
+            try:
+                os.remove(os.path.join(events_dir, f))
+                ev_count += 1
+            except Exception:
+                pass
+    results["event_files_deleted"] = ev_count
+    
+    # Reset camera AI state
+    for cam in cameras.values():
+        cam.clear()
+    
+    compressor.stats = {k: 0 for k in compressor.stats}
+    compressor.idle_batch.clear()
+    
+    results["status"] = "all_cleared"
+    results["timestamp"] = datetime.now().isoformat()
+    return results
+
+
 @app.get("/api/savings")
 def get_savings():
     first_cam = next(iter(cameras.values()), None)
@@ -1035,6 +1405,74 @@ def get_savings():
         "compression_stats": compressor.stats,
         "frames_processed": spike_count,
         "frames_skipped": frame_count - spike_count
+    }
+
+
+@app.get("/api/compression-proof")
+def compression_proof():
+    """Scan ALL storage folders on disk — reflects current state including deletions."""
+    raw_frame_kb = 900.0  # 640x480x3 bytes
+
+    def scan_dir(path, extensions=None):
+        count, kb = 0, 0.0
+        if not os.path.isdir(path):
+            return count, kb
+        for f in os.listdir(path):
+            fpath = os.path.join(path, f)
+            if not os.path.isfile(fpath):
+                continue
+            if extensions and not any(f.endswith(e) for e in extensions):
+                continue
+            count += 1
+            kb += os.path.getsize(fpath) / 1024
+        return count, kb
+
+    # Compressed frames
+    ev_files, ev_kb = scan_dir(os.path.join("storage", "events"), [".zst"])
+    idle_files, idle_kb = scan_dir(os.path.join("storage", "idle"), [".7z"])
+    norm_files, norm_kb = scan_dir(os.path.join("storage", "compressed"))
+
+    # Clips (hd + compressed subfolders + legacy flat)
+    clips_hd_files, clips_hd_kb = scan_dir(os.path.join("storage", "clips", "hd"), [".mp4"])
+    clips_comp_files, clips_comp_kb = scan_dir(os.path.join("storage", "clips", "compressed"), [".mp4"])
+    clips_flat_files, clips_flat_kb = scan_dir(os.path.join("storage", "clips"), [".mp4"])
+    total_clips_files = clips_hd_files + clips_comp_files + clips_flat_files
+    total_clips_kb = clips_hd_kb + clips_comp_kb + clips_flat_kb
+
+    # Pre-buffer
+    pb_files, pb_kb = scan_dir(os.path.join("storage", "prebuffer"), [".avi", ".mp4"])
+
+    # idle batches count as 100 frames each
+    idle_frame_count = idle_files * 100
+
+    categories = {
+        "events":    {"files": ev_files,          "size_kb": round(ev_kb, 1),         "estimated_raw_kb": round(ev_files * raw_frame_kb, 1)},
+        "idle":      {"files": idle_frame_count,   "size_kb": round(idle_kb, 1),        "estimated_raw_kb": round(idle_frame_count * raw_frame_kb, 1)},
+        "normal":    {"files": norm_files,         "size_kb": round(norm_kb, 1),        "estimated_raw_kb": round(norm_files * raw_frame_kb, 1)},
+        "clips":     {"files": total_clips_files,  "size_kb": round(total_clips_kb, 1), "estimated_raw_kb": 0},
+        "prebuffer": {"files": pb_files,           "size_kb": round(pb_kb, 1),          "estimated_raw_kb": 0},
+    }
+
+    for k in ["events", "idle", "normal"]:
+        v = categories[k]
+        v["ratio"] = round(v["estimated_raw_kb"] / max(v["size_kb"], 1), 1)
+        v["savings_pct"] = round((1 - v["size_kb"] / max(v["estimated_raw_kb"], 1)) * 100, 1) if v["estimated_raw_kb"] > 0 else 0
+
+    total_raw = sum(categories[k]["estimated_raw_kb"] for k in ["events", "idle", "normal"])
+    total_compressed = sum(categories[k]["size_kb"] for k in ["events", "idle", "normal"])
+    total_disk_kb = sum(v["size_kb"] for v in categories.values())
+    overall_ratio = round(total_raw / max(total_compressed, 1), 1)
+    overall_savings = round((1 - total_compressed / max(total_raw, 1)) * 100, 1) if total_raw > 0 else 0
+
+    return {
+        "total_frames_compressed": ev_files + idle_frame_count + norm_files,
+        "total_raw_kb": round(total_raw, 1),
+        "total_compressed_kb": round(total_compressed, 1),
+        "total_disk_kb": round(total_disk_kb, 1),
+        "overall_compression_ratio": f"{overall_ratio}x",
+        "overall_savings_percent": overall_savings,
+        "categories": categories,
+        "timestamp": datetime.now().isoformat()
     }
 
 
@@ -1121,6 +1559,10 @@ async def websocket_live(websocket: WebSocket):
     print("✅ WebSocket client connected")
     try:
         while True:
+            # Check if websocket is still open
+            if websocket.client_state.name != "CONNECTED":
+                break
+                
             cam_data = {}
             for cam_id, cam in cameras.items():
                 if cam.state['running'] or cam.state.get('current_frame'):
@@ -1133,6 +1575,15 @@ async def websocket_live(websocket: WebSocket):
                 "cameras": cam_data,
                 "active_count": sum(1 for c in cameras.values() if c.state['running']),
                 "timestamp": datetime.now().isoformat(),
+                "compression": {
+                    "original_bytes":   compressor.stats['original_bytes'],
+                    "compressed_bytes": compressor.stats['compressed_bytes'],
+                    "event_frames":     compressor.stats['event_frames'],
+                    "idle_frames":      compressor.stats['idle_frames'],
+                    "normal_frames":    compressor.stats['normal_frames'],
+                    "batches_archived": compressor.stats['batches_archived'],
+                    "savings_pct":      compressor.get_savings_percent()
+                },
             }
 
             # Backward compat: merge lightweight fields from first camera (exclude frame to avoid doubling)
@@ -1141,16 +1592,21 @@ async def websocket_live(websocket: WebSocket):
                     if k != 'frame':
                         payload[k] = v
 
-            await websocket.send_text(json.dumps(payload))
+            try:
+                await websocket.send_text(json.dumps(payload))
+            except (RuntimeError, ConnectionResetError):
+                # Client disconnected during send
+                break
             await asyncio.sleep(0.066)
     except WebSocketDisconnect:
-        print("❌ WebSocket client disconnected")
+        pass  # Clean disconnect
     except Exception as e:
-        print(f"⚠️ WebSocket error: {e}")
-        import traceback
-        traceback.print_exc()
+        # Only log unexpected errors
+        if "keepalive" not in str(e).lower() and "closed" not in str(e).lower():
+            print(f"⚠️ WebSocket error: {e}")
     finally:
         ws_clients.discard(websocket)
+        print("❌ WebSocket client disconnected")
 
 
 # ============================================================
